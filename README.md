@@ -1,9 +1,6 @@
 # 20250923PubMedStudy
 Full code for the article. See README for usage and authorship policy
 
-# 20250923PubMedStudy
-Full code for the article. See README for usage and authorship policy
-
 ## Usage & Authorship Policy
 
 This repository contains the full code used for the bibliographic analysis described in the article.

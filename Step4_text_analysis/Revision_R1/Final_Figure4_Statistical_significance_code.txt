@@ -1,0 +1,777 @@
+================================================================================
+This file is for Figure 4 / eFigures 20-22: presence of statistical significance
+(P-value, CI excluding the null, text statement), following Feng et al.
+Hum Reprod 2024;39(3):548-558, doi:10.1093/humrep/dead248
+
+This file contains the complete code of this analysis. Each section below is one
+script; the name of the script is given in the header of the section.
+    feng_rules.py          detection rules (one document -> flags)
+    scan.py                scan the corpus files, one JSON per corpus/category/year
+    aggregate.py           JSON -> counts.csv, proportions.csv/xlsx (Clopper-Pearson 95% CI)
+    make_figure6.py        proportions -> Figure 4 (main) and eFigures 20-22 (supplement)
+    compare_with_series.py check that P-value counts equal those of Figure 2A
+    run_all.sh             the sequence used for the article
+To run the code, save each section as a file with that name in one directory.
+
+Pipeline used for the article:
+  python3.11 scan.py --variant jno --categories all rct ct meta review cuj --procs 10
+  python3.11 aggregate.py --variant jno
+  python3.11 make_figure6.py --variant jno --layout main
+  python3.11 make_figure6.py --variant jno --layout supplement
+  python3.11 compare_with_series.py jno
+
+--variant jno: P-values are detected with the same module as the main analysis
+(Step0_modules/text_to_pval_and_oper.py, applied to the whole document), so the
+P-value line of Figure 4 is identical to Figure 2A. CIs and text statements are
+detected with the regular expressions published in Supplementary Data File S5 of
+Feng et al. --variant feng detects P-values with the Feng regular expression
+instead.
+
+Requirements: Python 3.11, regex, scipy, openpyxl, matplotlib.
+Input files are the corpus text files produced by Step 1 and Step 3
+(one document per line: ID, then text).
+================================================================================
+
+
+################################################################################
+# feng_rules.py
+################################################################################
+"""Detection rules for statements of statistical significance, following Feng et al (2024).
+
+A document (abstract or full text) is split into sentences. In each sentence we detect
+  (1) P-values          Feng S5 `Detect_All_P` (regular expression as published) or, with
+                        p_detector='jno', the P-value module of the main analysis;
+  (2) confidence intervals   Feng S5 `Only_CI` (as published). The point-estimate type captured
+                        by the same expression gives the null value (ratio -> 1, difference -> 0);
+  (3) text statements   Feng S5 `Text_dect` (as published) plus their filter for sentences that
+                        describe study objectives. Searched only in sentences without a P-value
+                        or a CI (Feng et al, Methods). The published code extracts the phrases but
+                        does not classify them; the significant / not significant classification
+                        below implements the three expression types described in their Methods.
+and return document-level flags.
+
+The R (ICU) regular expressions were transferred to the Python `regex` module. Changes:
+double backslashes of R strings -> single; ICU [:punct:] -> \\p{P}; named groups added to read
+the numbers and the point-estimate type (the matched span is unchanged). One misspelling in the
+point-estimate list of `Only_CI` ("[Hh]zard ratio") was corrected to "hazard ratio".
+Source: Feng et al, Supplementary Data File S5 and S6.
+"""
+import os
+import sys
+
+import regex
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+# Two further properties of the published CI expression are kept as published (switch off):
+#   (b) a negative lower bound written as "CI -0.4 to 4.6" loses its sign (the hyphen is consumed
+#       as punctuation) and is read as 0.4;
+#   (c) the greedy span between the point estimate and "CI" attaches the first point estimate of a
+#       sentence to the last CI when a sentence contains more than one CI.
+FIX_FENG_FLAWS = False
+FIX_HZARD_TYPO = True
+
+# ----------------------------------------------------------------------------- Feng S5: P-values
+FENG_P = regex.compile(
+    r"(([oO]dds ratio|[Rr]isk ratio|[Hh]zard ratio|[Rr]elative risk|[Rr]ate ratio|[Aa]OR|OR|[Aa]HR|HR|[Aa]RR|RR|[Aa]RD|RD|"
+    r"[Mm]ean difference|[Mm]edian difference|[Rr]isk [Dd]ifference|[aA]verage [Dd]ifference|[Dd]ifference(s)? in [Rr]isk|WMD|SMD)"
+    r"((?![Pp]).)*)?(\s|\(|\p{P})[Pp]{1}(\s|-)*(for)?(value|values)?(for)?(\s)*"
+    r"(?P<op>(=(\s)?(or)?(\s)?[<>](\s)?|[<>](\s)?(or|OR)?(\s)?|[:=<>≤≥]|/=|(\s)?trend(\s)?|(\s)?trend(\;|<|>|≤|≥|\:|\=)?|"
+    r"(\s)?interaction\s(effect)?(\s)?(\;|<|>|≤|≥|\:|\=)?|(\s)?interaction(effect)?(\s)?(\;|<|>|≤|≥|\:|\=)?|"
+    r"(\s)?equals|(\s)?equal|(\s)?over|(\s)?over than|(\s)?less than or equal to|(\s)?higher than|(\s)?larger than|"
+    r"(\s)?greater than|(\s)?more than|(\s)?lower than|(\s)?less than|less than|(\s)?smaller than|(\s)?of <)+)(\s)*"
+    r"(?P<ns>NS|not significant|n.s.|N.S.|ns|nonsignificant|non-significant)?(\s)?"
+    r"(?P<num>(([0-9][\,|\.|\·|•]|[\,|\.|\·|•])(\s)*[0-9]*)|[0-9]*)"
+    r"(?P<suf>((\%)?|([x|×]? (\s)*[0-9]*(\s)*((exp|Exp|E|e)?(\s)*((\((\s)*(-){1}(\s)*[0-9]+(\s)*\))|((\s)*(-){1}(\s)*[0-9]+)))?)))"
+)
+# Same expression without the optional point-estimate prefix. The prefix cannot contain "P"/"p",
+# so the P-value matches are the same; this version runs about 4 times faster.
+FENG_P_FAST = regex.compile(FENG_P.pattern.split(r"((?![Pp]).)*)?", 1)[1])
+_P_LT_WORDS = regex.compile(r"less than|lower than|smaller than|of <", regex.I)
+_P_GT_WORDS = regex.compile(r"higher than|larger than|greater than|more than|over", regex.I)
+_P_EQ_WORDS = regex.compile(r"equal", regex.I)
+_EXP = regex.compile(r"(?P<base>[0-9]*)\s*(?:exp|Exp|E|e)?\s*\(?\s*-\s*(?P<exp>[0-9]+)")
+
+
+def classify_op(op):
+    """Operator classes of the main analysis (eMethods): '<' (<, <<, <=, =<, 'less than' ...),
+    '>' (>, >>, >=, =>, 'greater than' ...), '=' (=, ==, :, 'equal'), 'ambiguous' (<>, ><).
+    'P for trend 0.03' (no symbol) is read as '='."""
+    o = op.replace('≤', '<').replace('≥', '>')
+    lt = '<' in o or bool(_P_LT_WORDS.search(o))
+    gt = '>' in o or bool(_P_GT_WORDS.search(o))
+    if lt and gt:
+        return 'ambiguous'
+    if lt:
+        return '<'
+    if gt:
+        return '>'
+    if '=' in o or ':' in o or '/=' in o or _P_EQ_WORDS.search(o):
+        return '='
+    return '='
+
+
+def parse_p(m):
+    """Match of FENG_P -> (value, operator) or None.
+    Post-processing rules of the main analysis (eMethods): values outside (0, 1) are discarded;
+    '%' multiplies by 0.01; operators are classified; '>' reports are kept (excluded only from
+    the significance test); exponent notation with base 0 or no base is read as base 10.
+    'P = NS' and similar are kept as (None, 'NS'): a report without a value, not significant."""
+    op = classify_op(m.group('op'))
+    num = (m.group('num') or '').strip()
+    suf = (m.group('suf') or '').strip()
+    ns = m.group('ns')
+    if not num:
+        return (None, 'NS') if ns else None
+    if '|' in num:                                          # a vertical bar matched by the character class: not a number
+        return None
+    num = regex.sub(r'[\,\·•]', '.', num).replace(' ', '')
+    if num.count('.') > 1:
+        return None
+    try:
+        val = float(num)
+    except ValueError:
+        return None
+    if suf == '%':
+        val *= 0.01
+    elif suf:
+        e = _EXP.search(suf)
+        if e:
+            base = float(e.group('base')) if e.group('base') else 0.0
+            if base == 0:
+                base = 10.0
+            val = val * base ** (-float(e.group('exp')))
+    if not (0 < val < 1):
+        return None
+    return (val, op)
+
+
+def p_values_feng(sentence):
+    """P-values found with the Feng expression: [(value or None, operator)].
+    The expression requires a space, parenthesis or punctuation before 'P', so a space is prepended."""
+    out = []
+    for m in FENG_P_FAST.finditer(' ' + sentence):
+        r = parse_p(m)
+        if r:
+            out.append(r)
+    return out
+
+
+# ------------------------------------------------ P-values with the module of the main analysis
+# Step0_modules/text_to_pval_and_oper.py is used unchanged. The module directory is found by
+# walking up from this file; it can also be given in the environment variable STEP0_MODULES.
+def _find_step0():
+    env = os.environ.get('STEP0_MODULES')
+    if env:
+        return env
+    d = _HERE
+    for _ in range(6):
+        cand = os.path.join(d, 'Step0_modules')
+        if os.path.isdir(cand):
+            return cand
+        d = os.path.dirname(d)
+    raise FileNotFoundError('Step0_modules not found; set STEP0_MODULES')
+
+
+_jno = None
+
+
+def p_values_jno(text):
+    """P-values found with text_to_pval_and_oper: [(value, operator)]."""
+    global _jno
+    if _jno is None:
+        step0 = _find_step0()
+        if step0 not in sys.path:
+            sys.path.insert(0, step0)
+        from modules.text_to_pval_and_oper import text_to_pval_and_oper
+        _jno = text_to_pval_and_oper
+    return _jno(' ' + text)
+
+
+def p_is_sig_jno(pval, oper):
+    """Rule of Figure 2A: value .05 or less and operator not '>' (the module maps ≤ to < and ≥ to >)."""
+    return pval is not None and pval <= 0.05 and oper != '>'
+
+
+P_DETECTORS = {'feng': (p_values_feng, None), 'jno': (p_values_jno, p_is_sig_jno)}
+
+
+def p_values(sentence):
+    return p_values_feng(sentence)
+
+
+# ----------------------------------------------------------------------------- Feng S5: CIs
+_EST = (r"[oO]dds ratio|[Rr]isk ratio|" + (r"[Hh]azard ratio|" if FIX_HZARD_TYPO else r"[Hh]zard ratio|") + r"[Rr]elative risk|[Rr]ate ratio|[Aa]OR|OR|[Aa]HR|HR|[Aa]RR|RR|[Aa]RD|RD|"
+        r"[Mm]ean difference|[Mm]edian difference|[Rr]isk [Dd]ifference|[aA]verage [Dd]ifference|[Dd]ifference(s)? in [Rr]isk|WMD|SMD")
+FENG_CI = regex.compile(
+    r"((?P<est>" + _EST + r")((?![Pp|OR]).)*" + ("?" if FIX_FENG_FLAWS else "") + r")?"
+    r"(95\s?\%?)?\s?([Cc]onfidence [Ii]nterval(\s[\(\[\{]\bCI\b[\)\]\}])?|\bCI\b)\s?" + (r"(?!-\d)" if FIX_FENG_FLAWS else "") + r"\p{P}?(\s)?\=?\,?\s?"
+    r"(?P<lo>(\-)?\d+\.?\d*)(\-|\sto|\–|\,|\;)\s?(?P<hi>(\-)?\d+\.?\d*)"
+)
+# Null value by point-estimate type (Feng et al, Methods): ratios -> 1, differences -> 0.
+_RATIO = regex.compile(r"ratio|relative risk|\b[Aa]?OR\b|\b[Aa]?HR\b|\b[Aa]?RR\b", regex.I)
+_DIFF = regex.compile(r"difference|\b[Aa]?RD\b|WMD|SMD", regex.I)
+
+
+def ci_null(est):
+    """'ratio' -> 1.0, 'difference' -> 0.0, unknown -> None."""
+    if not est:
+        return None
+    if _DIFF.search(est):
+        return 0.0
+    if _RATIO.search(est):
+        return 1.0
+    return None
+
+
+# ----------------------------------------------------------------------------- Feng S5: text
+FENG_TEXT = regex.compile(r"(([\w\s]+)?(\s)?[sS]ignificant(ly)?\s[\w\s]+)|[\w\s]+\sdiffer(ence|ences|ent)\s[\w\s]+")
+# Feng: phrases describing study objectives are removed.
+FENG_TEXT_DROP = regex.compile(r"To determine|objective|To assess|aim|investigate|purpose|known|surgical difference|\bTo\b")
+
+# Classification of the extracted phrases (the three expression types of Feng et al, Methods):
+#   'significantly higher ... than'  -> significant
+#   'no significant difference'      -> not significant
+#   'no difference'                  -> not significant
+#   'difference' without 'significant' and without a negation -> treated as 'no significant difference'
+_NEG_SIG = regex.compile(
+    r"\b(no|not|non|nor|neither|without|never|insignificant|lack(?:ed|s|ing)?\s+of|absence\s+of|failed\s+to|fail(?:s|ed)?\s+to|"
+    r"did\s+not|does\s+not|do\s+not|was\s+not|were\s+not|is\s+not|are\s+not|had\s+no|has\s+no|have\s+no)\b[\w\s,-]{0,40}?\bsignificant"
+    r"|\bnon-?significant", regex.I)
+_SIG = regex.compile(r"\bsignificant(?:ly)?\b", regex.I)
+_NO_DIFF = regex.compile(r"\b(no|not|neither|without|lack(?:ed|s|ing)?\s+of|absence\s+of|did\s+not|does\s+not|do\s+not)\b[\w\s,-]{0,30}?\bdiffer", regex.I)
+
+# Optional (off by default, not used in the article): sentences that state a significance threshold
+# ("P < 0.05 was considered statistically significant") can be skipped with --drop-threshold-sentences.
+THRESHOLD_SENT = regex.compile(
+    r"\b(considered|regarded|defined|deemed|accepted|taken|set|chosen|used|denote[sd]?|indicat(?:e|es|ed|ing)|represent(?:s|ed)?|interpreted)\b"
+    r"[^.;]{0,60}\bsignifican"
+    r"|\b(level|threshold|cut-?off|criterion|criteria)\s+(of|for)\s+(statistical\s+)?significance"
+    r"|\bsignificance\s+(level|threshold)\b|\balpha\s+(level|of|=)|\btwo-?(sided|tailed)\b|\bone-?(sided|tailed)\b",
+    regex.I)
+
+# ----------------------------------------------------------------------------- sentences
+# A sentence ends at '.', '?' or '!' followed by whitespace and an upper-case letter, digit,
+# bracket or quotation mark. Tabs (fields of structured abstracts) also separate sentences.
+# No character normalization is applied to the text.
+_SPLIT = regex.compile(r"(?<=[.!?])\s+(?=[A-Z0-9(\[\"'])|\t+")
+
+
+def split_sentences(text):
+    return [s.strip() for s in _SPLIT.split(text) if s and s.strip()]
+
+
+# ----------------------------------------------------------------------------- analysis
+def p_is_sig(pval, oper):
+    """Feng et al: a P-value of 0.05 or less is statistically significant; '≤' is read as '<' and '≥' as '>'.
+    Significant = operator '=' or '<' and value <= 0.05. 'NS' and reports without a value are not significant."""
+    return pval is not None and oper in ('=', '<') and pval <= 0.05
+
+
+_PRE_CI = regex.compile(r"CI|onfidence [Ii]nterval")          # required by FENG_CI; sentences without it cannot match
+_PRE_TX = regex.compile(r"ignificant|differ")                  # required by FENG_TEXT
+
+
+def confidence_intervals(sentence):
+    """[(est, lo, hi, null, sig)]; sig is True/False, or None when the null value is unknown."""
+    out = []
+    if not _PRE_CI.search(sentence):
+        return out
+    for m in FENG_CI.finditer(sentence):
+        est = m.group('est')
+        try:
+            lo, hi = float(m.group('lo')), float(m.group('hi'))
+        except ValueError:
+            continue
+        null = ci_null(est)
+        sig = None if null is None else (lo > null or hi < null) if lo <= hi else (hi > null or lo < null)
+        out.append((est, lo, hi, null, sig))
+    return out
+
+
+def classify_text(sentence):
+    """'sig', 'nonsig', or None (no statement, or a phrase describing study objectives)."""
+    hit = None
+    if not _PRE_TX.search(sentence):
+        return None
+    for m in FENG_TEXT.finditer(sentence):
+        phrase = m.group(0)
+        if FENG_TEXT_DROP.search(phrase):
+            continue
+        hit = phrase
+        break
+    if hit is None:
+        return None
+    if _NEG_SIG.search(sentence) or _NO_DIFF.search(sentence):
+        return 'nonsig'
+    if _SIG.search(sentence):
+        return 'sig'
+    return 'nonsig'
+
+
+def analyze(text, drop_threshold_sentences=False, p_detector='feng'):
+    """One document -> document flags and statement counts.
+    hasP / P_sig            : has a P-value / has a significant P-value
+    hasCI / hasCIcls / CI_sig : has a CI / has a CI with an identifiable null / has a CI excluding the null
+    hasTX / TX_sig          : has a text statement (in sentences without P-value or CI) / has a significant one
+    hasINF / INF_sig        : any of the three forms / any of the three forms significant
+    nP, nP_sig, nCI, nCIcls, nCI_sig, nTX, nTX_sig : statement counts
+    """
+    f = dict(hasP=0, P_sig=0, hasCI=0, hasCIcls=0, CI_sig=0, hasTX=0, TX_sig=0, hasINF=0, INF_sig=0,
+             nP=0, nP_sig=0, nCI=0, nCIcls=0, nCI_sig=0, nTX=0, nTX_sig=0, n_thr=0)
+    pv, psig = P_DETECTORS[p_detector]
+    psig = psig or p_is_sig
+    if p_detector == 'jno':
+        # P-values are detected on the whole document, exactly as in Figures 1-3 of the article.
+        # Sentence-level detection below is used only to find sentences without a P-value or a CI.
+        ps_doc = p_values_jno(text)
+        if ps_doc:
+            f['hasP'] = 1
+            f['nP'] = len(ps_doc)
+            k = sum(1 for v, op in ps_doc if psig(v, op))
+            f['nP_sig'] = k
+            if k:
+                f['P_sig'] = 1
+    for s in split_sentences(text):
+        if drop_threshold_sentences and THRESHOLD_SENT.search(s):
+            f['n_thr'] += 1
+            continue
+        ps = pv(s)
+        cis = confidence_intervals(s)
+        if ps and p_detector != 'jno':
+            f['hasP'] = 1
+            f['nP'] += len(ps)
+            k = sum(1 for v, op in ps if psig(v, op))
+            f['nP_sig'] += k
+            if k:
+                f['P_sig'] = 1
+        if cis:
+            f['hasCI'] = 1
+            f['nCI'] += len(cis)
+            cls = [c for c in cis if c[4] is not None]
+            f['nCIcls'] += len(cls)
+            if cls:
+                f['hasCIcls'] = 1
+            k = sum(1 for c in cls if c[4])
+            f['nCI_sig'] += k
+            if k:
+                f['CI_sig'] = 1
+        if not ps and not cis:
+            t = classify_text(s)
+            if t:
+                f['hasTX'] = 1
+                f['nTX'] += 1
+                if t == 'sig':
+                    f['TX_sig'] = 1
+                    f['nTX_sig'] += 1
+    f['hasINF'] = int(f['hasP'] or f['hasCI'] or f['hasTX'])
+    f['INF_sig'] = int(f['P_sig'] or f['CI_sig'] or f['TX_sig'])
+    return f
+
+
+FIELDS = ['hasP', 'P_sig', 'hasCI', 'hasCIcls', 'CI_sig', 'hasTX', 'TX_sig', 'hasINF', 'INF_sig',
+          'nP', 'nP_sig', 'nCI', 'nCIcls', 'nCI_sig', 'nTX', 'nTX_sig', 'n_thr']
+
+
+def explain(text, drop_threshold_sentences=False):
+    """For inspection: what was detected in each sentence."""
+    rows = []
+    for i, s in enumerate(split_sentences(text), 1):
+        thr = bool(THRESHOLD_SENT.search(s))
+        ps = [] if (thr and drop_threshold_sentences) else p_values(s)
+        cis = [] if (thr and drop_threshold_sentences) else confidence_intervals(s)
+        tx = None if (ps or cis or (thr and drop_threshold_sentences)) else classify_text(s)
+        rows.append(dict(no=i, sentence=s, threshold=thr,
+                         P='; '.join(f'{op}{pv if pv is None else format(pv, "g")}' + ('*' if p_is_sig(pv, op) else '') for pv, op in ps),
+                         CI='; '.join(f'{(e or "?")} {lo:g}-{hi:g}' + ('*' if sg else '' if sg is False else '?') for e, lo, hi, nl, sg in cis),
+                         TEXT=tx or ''))
+    return rows
+
+
+################################################################################
+# scan.py
+################################################################################
+"""Scan the corpus files and write one JSON of yearly counts per corpus, category and year.
+
+Input (output of Step 1 and Step 3; one document per line):
+  PubMed abstracts : {PUBMED_DIR}/{all|rct|ct|meta|review|cuj}/pmxtract_list_{fld}_{year}.txt
+  PMC abstracts    : {PMC_DIR}/{fld}/pmcxtract_list_{fld}_{year}_abstract.txt
+  PMC full texts   : {PMC_DIR}/{fld}/pmcxtract_list_{fld}_{year}_body.txt
+     fld = all-articles | randomized-controlled-trial | clinical-trial | meta-analysis | review | clinical-useful-journal
+
+Usage
+  python3.11 scan.py --variant jno --categories all rct ct meta review cuj --procs 10
+  python3.11 scan.py --corpora pubmed --years 2020 2021 --sample 20000      # test run (first 20000 documents per file)
+Existing JSON files are skipped (--force to redo). Results of --sample runs go to out/scan_sample/.
+Set PUBMED_DIR and PMC_DIR below or in the environment.
+"""
+import argparse
+import re
+import json
+import os
+import sys
+import time
+from multiprocessing import Pool
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from feng_rules import FIELDS, analyze  # noqa: E402
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+OUT = os.path.join(HERE, 'out', 'scan')
+PUBMED_DIR = os.environ.get('PUBMED_DIR', '/Volumes/ssd4TB/pubmed/xtract')
+PMC_DIR = os.environ.get('PMC_DIR', '/Volumes/ssd4TB/20251080/result')
+PUBMED = {'all': 'all', 'rct': 'rct', 'ct': 'ct', 'meta': 'meta', 'review': 'review', 'cuj': 'cuj'}
+PMC = {'all': 'all-articles', 'rct': 'randomized-controlled-trial', 'ct': 'clinical-trial', 'meta': 'meta-analysis',
+       'review': 'review', 'cuj': 'clinical-useful-journal'}
+
+
+def path_of(corpus, cat, year):
+    if corpus == 'pubmed':
+        return f'{PUBMED_DIR}/{PUBMED[cat]}/pmxtract_list_{PUBMED[cat]}_{year}.txt'
+    fld = PMC[cat]
+    kind = 'abstract' if corpus == 'pmcabs' else 'body'
+    return f'{PMC_DIR}/{fld}/pmcxtract_list_{fld}_{year}_{kind}.txt'
+
+
+def split_line(line, corpus):
+    """(id, text). PMC lines are 'PMCxxxx text'.
+    PubMed lines are 'PMID<TAB>text' (structured abstracts have more tab-separated fields); in the
+    category files some lines carry no PMID. One line is one document in every file, so the
+    numeric-only field (the PMID), wherever it is, is removed and the remaining fields are the text."""
+    if corpus == 'pubmed':
+        fields = line.split('\t')
+        ids = [f for f in fields if re.fullmatch(r'\d+', f.strip())]
+        texts = [f for f in fields if not re.fullmatch(r'\d+', f.strip())]
+        return (ids[0] if ids else '', '\t'.join(texts))
+    parts = line.split(' ', 1)
+    return (parts[0], parts[1]) if len(parts) == 2 else (parts[0], '')
+
+
+def scan_file(job):
+    corpus, cat, year, sample, drop_thr, variant = job
+    src = path_of(corpus, cat, year)
+    out_dir = OUT + ('_' + variant if variant != 'feng' else '') + ('_sample' if sample else '')
+    dst = os.path.join(out_dir, f'{corpus}_{cat}_{year}.json')
+    if not os.path.exists(src):
+        return (corpus, cat, year, 'missing', 0, 0)
+    t0 = time.time()
+    agg = {k: 0 for k in FIELDS}
+    tot = empty = 0
+    with open(src, 'r', encoding='utf-8', errors='replace') as f:
+        for line in f:
+            line = line.rstrip('\n')
+            if not line.strip():
+                continue
+            _id, text = split_line(line, corpus)
+            if not text.strip():
+                empty += 1
+                continue
+            tot += 1
+            r = analyze(text, drop_thr, variant)
+            for k in FIELDS:
+                agg[k] += r[k]
+            if sample and tot >= sample:
+                break
+    rec = dict(corpus=corpus, category=cat, year=year, tot=tot, empty=empty, sample=sample or 0, p_detector=variant,
+               drop_threshold_sentences=drop_thr, seconds=round(time.time() - t0), **agg)
+    os.makedirs(out_dir, exist_ok=True)
+    with open(dst, 'w') as f:
+        json.dump(rec, f, indent=1)
+    return (corpus, cat, year, 'ok', tot, rec['seconds'])
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--corpora', nargs='+', default=['pubmed', 'pmcabs', 'pmcbody'])
+    ap.add_argument('--categories', nargs='+', default=['all', 'rct'])
+    ap.add_argument('--years', nargs='+', type=int, default=list(range(1990, 2026)))
+    ap.add_argument('--procs', type=int, default=4)
+    ap.add_argument('--sample', type=int, default=0, help='first N documents of each file only (test run)')
+    ap.add_argument('--drop-threshold-sentences', action='store_true', help="skip sentences that state a significance threshold (not used in the article)")
+    ap.add_argument('--variant', choices=['feng', 'jno'], default='feng', help="P-value detector: feng (Feng expression) | jno (module of the main analysis; used in the article). Output goes to out/scan_jno/")
+    ap.add_argument('--force', action='store_true')
+    a = ap.parse_args()
+    jobs = []
+    for c in a.corpora:
+        for cat in a.categories:
+            for y in a.years:
+                dst = os.path.join(OUT + ('_' + a.variant if a.variant != 'feng' else '') + ('_sample' if a.sample else ''), f'{c}_{cat}_{y}.json')
+                if os.path.exists(dst) and not a.force:
+                    continue
+                jobs.append((c, cat, y, a.sample, a.drop_threshold_sentences, a.variant))
+    jobs.sort(key=lambda j: (j[0] != 'pmcbody', j[0] != 'pubmed', -j[2]))     # largest files first
+    print(f'{len(jobs)} files, {a.procs} procs', flush=True)
+    t0 = time.time()
+    with Pool(a.procs) as pool:
+        for c, cat, y, st, tot, sec in pool.imap_unordered(scan_file, jobs):
+            print(f'{c:8s} {cat:6s} {y} {st:8s} docs={tot:>9,d} {sec:>5d}s  (elapsed {int(time.time()-t0)}s)', flush=True)
+    print('done', int(time.time() - t0), 's')
+
+
+if __name__ == '__main__':
+    main()
+
+
+################################################################################
+# aggregate.py
+################################################################################
+"""out/scan*/*.json -> out/counts.csv, out/proportions.csv/xlsx (Clopper-Pearson 95% CI).
+
+Proportions are defined as in Figure 6 of Feng et al (each line has its own denominator):
+  any  = INF_sig / hasINF      articles with a significant statement of any form, among articles with any statement
+  ci   = CI_sig  / hasCIcls    articles with a CI excluding the null, among articles with a CI whose null is identifiable
+  p    = P_sig   / hasP        articles with a P-value <= .05, among articles with a P-value
+  text = TX_sig  / hasTX       articles with a significant text statement, among articles with a text statement
+Usage: python3.11 aggregate.py --variant jno
+"""
+import csv
+import glob
+import json
+import os
+
+import openpyxl
+from scipy.stats import beta
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+OUT = os.path.join(HERE, 'out')
+LINES = [('any', 'INF_sig', 'hasINF'), ('ci', 'CI_sig', 'hasCIcls'), ('p', 'P_sig', 'hasP'), ('text', 'TX_sig', 'hasTX')]
+
+
+def cp(k, n):
+    if n == 0:
+        return (float('nan'),) * 3
+    lo = 0.0 if k == 0 else beta.ppf(0.025, k, n - k + 1)
+    hi = 1.0 if k == n else beta.ppf(0.975, k + 1, n - k)
+    return 100 * k / n, 100 * lo, 100 * hi
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(); ap.add_argument('--variant', choices=['feng', 'jno'], default='feng'); a = ap.parse_args()
+    sfx = '' if a.variant == 'feng' else '_' + a.variant
+    recs = [json.load(open(p)) for p in sorted(glob.glob(os.path.join(OUT, 'scan' + sfx, '*.json')))]
+    if not recs:
+        raise SystemExit('no scan results in out/scan; run scan.py first')
+    recs.sort(key=lambda r: (r['corpus'], r['category'], r['year']))
+    keys = []
+    for r in recs:
+        for k in r:
+            if k not in keys:
+                keys.append(k)
+    with open(os.path.join(OUT, f'counts{sfx}.csv'), 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=keys)
+        w.writeheader()
+        w.writerows(recs)
+    rows = []
+    for r in recs:
+        row = dict(corpus=r['corpus'], category=r['category'], year=r['year'], tot=r['tot'])
+        for name, num, den in LINES:
+            p, lo, hi = cp(r[num], r[den])
+            row[f'{name}_n'], row[f'{name}_k'], row[f'{name}_pct'], row[f'{name}_lo'], row[f'{name}_hi'] = r[den], r[num], p, lo, hi
+        rows.append(row)
+    with open(os.path.join(OUT, f'proportions{sfx}.csv'), 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        w.writerows(rows)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = 'proportions'
+    ws.append(list(rows[0].keys()))
+    for row in rows:
+        ws.append(list(row.values()))
+    wb.save(os.path.join(OUT, f'proportions{sfx}.xlsx'))
+    print(len(recs), 'rows ->', os.path.join(OUT, f'counts{sfx}.csv'), os.path.join(OUT, f'proportions{sfx}.xlsx'))
+
+
+if __name__ == '__main__':
+    main()
+
+
+################################################################################
+# make_figure6.py
+################################################################################
+"""out/proportions*.csv -> PDF/PNG. Denominators as in Figure 6 of Feng et al (each line its own).
+
+  python3.11 make_figure6.py --variant jno --layout main         # Figure 4: PubMed abstracts (all, RCT) + PMC full-texts (all, RCT)
+  python3.11 make_figure6.py --variant jno --layout supplement   # eFigure 20 (PubMed abstracts), 21 (PMC abstracts), 22 (PMC full-texts);
+                                                                 # 6 panels each: RCT, clinical trials, meta-analyses, reviews, CUJ, all
+Points are annual proportions; lines are centered 3-year rolling averages (--rolling 3; --trailing for a
+trailing window as in Feng et al; --rolling 0 for lines through the annual values). Years with fewer than
+6 articles in the denominator are not drawn (--min-n 6).
+Output: out/Figure4[_jno].pdf/png, out/eFigure20-22[_jno].pdf/png
+"""
+import argparse
+import csv
+import os
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt  # noqa: E402
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+OUT = os.path.join(HERE, 'out')
+plt.rcParams.update({'font.family': 'Arial', 'pdf.fonttype': 42, 'ps.fonttype': 42, 'font.size': 8})
+
+CNAME = {'pubmed': 'PubMed abstracts', 'pmcabs': 'PMC abstracts', 'pmcbody': 'PMC full-texts'}
+CATS = {'all': 'All articles', 'rct': 'Randomized controlled trials', 'ct': 'Clinical trials', 'meta': 'Meta-analyses',
+        'review': 'Reviews', 'cuj': 'Clinically Useful Journals'}
+SUPP_CATS = ['rct', 'ct', 'meta', 'review', 'cuj', 'all']
+TRAILING = [False]
+LAYOUTS = {
+    'main': dict(panels=[('pubmed', 'all'), ('pubmed', 'rct'), ('pmcbody', 'all'), ('pmcbody', 'rct')], ncol=2, out='Figure4'),
+    'supplement': None,
+}
+SUPP = [('eFigure20', 'pubmed'), ('eFigure21', 'pmcabs'), ('eFigure22', 'pmcbody')]
+# The four lines of Figure 6 of Feng et al, in their colors
+LINES = [('any', 'Statistical significance in at least 1 form', '#E41A1C', 's'),
+         ('ci', 'Statistical significance in effect measures (CI excluding the null)', '#377EB8', 'o'),
+         ('p', 'Statistical significance in P-value', '#984EA3', '^'),
+         ('text', 'Statistical significance in text', '#4DAF4A', 'D')]
+
+
+def rolling_mean(vals, k, centered=True):
+    """k-year rolling mean. centered=True: (k-1)/2 years on each side; False: trailing k years."""
+    out = []
+    h = (k - 1) // 2
+    for i in range(len(vals)):
+        if vals[i] != vals[i]:                               # no point in that year -> no line either
+            out.append(float('nan'))
+            continue
+        lo, hi = (i - h, i + h + 1) if centered else (i - k + 1, i + 1)
+        win = [v for v in vals[max(0, lo):hi] if v == v]
+        out.append(sum(win) / len(win) if win else float('nan'))
+    return out
+
+
+def draw(ax, rows, corpus, cat, rolling, min_n):
+    sub = sorted([r for r in rows if r['corpus'] == corpus and r['category'] == cat], key=lambda r: int(r['year']))
+    for key, label, color, marker in LINES:
+        ys = [int(r['year']) for r in sub]
+        vs = [float(r[f'{key}_pct']) if int(float(r[f'{key}_n'])) >= min_n else float('nan') for r in sub]
+        if rolling:
+            ax.plot(ys, vs, marker=marker, ms=2.5, lw=0, color=color, alpha=0.6, clip_on=False)
+            ax.plot(ys, rolling_mean(vs, rolling, not TRAILING[0]), lw=1.4, color=color, label=label)
+        else:
+            ax.plot(ys, vs, marker=marker, ms=2.5, lw=1.2, color=color, label=label)
+    ax.set_ylim(0, 100)
+    ax.set_yticks([0, 20, 40, 60, 80, 100])
+    ax.set_xlim(1989, 2026)
+    ax.set_xticks([1990, 1995, 2000, 2005, 2010, 2015, 2020, 2025])
+    for sp in ('top', 'right'):
+        ax.spines[sp].set_visible(False)
+
+
+def save(fig, stem):
+    for ext in ('pdf', 'png'):
+        fig.savefig(os.path.join(OUT, f'{stem}.{ext}'), dpi=300, bbox_inches='tight')
+    print('->', os.path.join(OUT, stem + '.pdf'))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--layout', choices=['main', 'supplement'], default='main')
+    ap.add_argument('--rolling', type=int, default=3, help='rolling window in years (0 = lines through annual values)')
+    ap.add_argument('--trailing', action='store_true', help='trailing window instead of centered')
+    ap.add_argument('--min-n', type=int, default=6, help='years with a smaller denominator are not drawn')
+    ap.add_argument('--variant', choices=['feng', 'jno'], default='feng', help='jno = P-values with the module of the main analysis; files get the suffix _jno')
+    a = ap.parse_args()
+    TRAILING[0] = a.trailing
+    sfx = '' if a.variant == 'feng' else '_' + a.variant
+    rows = list(csv.DictReader(open(os.path.join(OUT, f'proportions{sfx}.csv'))))
+    ylabel = 'Articles with ≥1 statistically\nsignificant statement, %'
+    if a.layout == 'supplement':
+        for stem, corpus in SUPP:
+            cats = [c for c in SUPP_CATS if any(r['corpus'] == corpus and r['category'] == c for r in rows)]
+            nc, nr = 3, -(-len(cats) // 3)
+            fig, axes = plt.subplots(nr, nc, figsize=(3.6 * nc, 2.7 * nr), squeeze=False)
+            for k, cat in enumerate(cats):
+                ax = axes[k // nc][k % nc]
+                draw(ax, rows, corpus, cat, a.rolling, a.min_n)
+                ax.set_title(f'{chr(65 + k)}. {CATS[cat]}', loc='left', fontsize=8, fontweight='bold', pad=10)
+                if k % nc == 0:
+                    ax.set_ylabel(ylabel)
+                if k // nc == nr - 1:
+                    ax.set_xlabel('Year')
+            for k in range(len(cats), nr * nc):
+                axes[k // nc][k % nc].axis('off')
+            h, l = axes[0][0].get_legend_handles_labels()
+            fig.legend(h, l, loc='lower center', ncol=2, frameon=False, fontsize=7, bbox_to_anchor=(0.5, -0.02))
+            fig.suptitle(CNAME[corpus], x=0.01, ha='left', fontsize=9, fontweight='bold')
+            fig.tight_layout(rect=(0, 0.08, 1, 0.97))
+            save(fig, stem + sfx)
+        return
+    lay = LAYOUTS['main']
+    nc = lay['ncol']
+    nr = -(-len(lay['panels']) // nc)
+    fig, axes = plt.subplots(nr, nc, figsize=(3.6 * nc, 2.7 * nr), squeeze=False)
+    for k, (corpus, cat) in enumerate(lay['panels']):
+        ax = axes[k // nc][k % nc]
+        draw(ax, rows, corpus, cat, a.rolling, a.min_n)
+        ax.set_title(f'{chr(65 + k)}. {CNAME[corpus]}, {CATS[cat].lower()}', loc='left', fontsize=8, fontweight='bold', pad=10)
+        if k % nc == 0:
+            ax.set_ylabel(ylabel)
+        if k // nc == nr - 1:
+            ax.set_xlabel('Year')
+    h, l = axes[0][0].get_legend_handles_labels()
+    fig.legend(h, l, loc='lower center', ncol=2, frameon=False, fontsize=7, bbox_to_anchor=(0.5, -0.02))
+    fig.tight_layout(rect=(0, 0.08, 1, 1))
+    save(fig, lay['out'] + sfx)
+
+
+if __name__ == '__main__':
+    main()
+
+
+################################################################################
+# compare_with_series.py
+################################################################################
+"""Check that the P-value counts of the scan equal those behind Figure 2A of the article.
+  articles reporting a P-value (hasP)       <-> M1 numerator of series.csv
+  articles with >= 1 P-value <= .05 (P_sig) <-> M3 numerator of series.csv
+series.csv is the yearly numerator/denominator table of the main analysis
+(Step4_text_analysis/Revision_R1/Figure3_trend_splines/out/series.csv). Its denominators count
+empty abstract lines, so they may differ from tot; this is reported separately.
+Usage: python3.11 compare_with_series.py jno
+"""
+import csv, os, sys
+HERE = os.path.dirname(os.path.abspath(__file__))
+SERIES = os.environ.get('SERIES_CSV', os.path.join(HERE, '..', 'Figure3_trend_splines', 'out', 'series.csv'))
+variant = sys.argv[1] if len(sys.argv) > 1 else 'jno'
+sfx = '' if variant == 'feng' else '_' + variant
+C = {'pubmed': 'PubMed abstracts', 'pmcabs': 'PMC abstracts', 'pmcbody': 'PMC full-texts'}
+S = {'all': 'all', 'rct': 'RCT', 'ct': 'CT', 'meta': 'meta', 'review': 'review', 'cuj': 'CUJ'}
+ser = {}
+for r in csv.DictReader(open(SERIES)):
+    ser[(r['corpus'], r['sub'], int(r['year']), r['metric'][:2])] = (int(r['num']), int(r['den']))
+rows = list(csv.DictReader(open(os.path.join(HERE, 'out', f'counts{sfx}.csv'))))
+n = bad_hasP = bad_sig = bad_tot = 0; examples = []
+for r in rows:
+    key = (C[r['corpus']], S[r['category']], int(r['year']))
+    m1 = ser.get(key + ('M1',)); m3 = ser.get(key + ('M3',))
+    if not m1 or not m3:
+        continue
+    n += 1
+    if m1[0] != int(r['hasP']):
+        bad_hasP += 1; examples.append((key, 'hasP', m1[0], int(r['hasP'])))
+    if m3[0] != int(r['P_sig']):
+        bad_sig += 1; examples.append((key, 'P_sig', m3[0], int(r['P_sig'])))
+    if m1[1] != int(r['tot']):
+        bad_tot += 1
+print(f'compared {n} cells (corpus x category x year) | hasP differs {bad_hasP} | P_sig differs {bad_sig} | denominators differ {bad_tot} (empty lines)')
+for e in examples[:12]:
+    print('  ', e)
+print('RESULT:', 'IDENTICAL' if bad_hasP == 0 and bad_sig == 0 else 'DIFFERENT')
+
+
+################################################################################
+# run_all.sh
+################################################################################
+#!/bin/bash
+# Full run for Figure 4 and eFigures 20-22, then the check against Figure 2A.
+cd "$(dirname "$0")"
+PY=python3.11
+$PY scan.py --variant jno --categories all rct ct meta review cuj --procs 10 > out/scan_jno.log 2>&1
+$PY aggregate.py --variant jno
+$PY make_figure6.py --variant jno --layout main
+$PY make_figure6.py --variant jno --layout supplement
+$PY compare_with_series.py jno
